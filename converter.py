@@ -674,7 +674,7 @@ class ConverterApp:
 
         pill = tk.Frame(inner, bg=ACCENT_SOFT, padx=12, pady=5)
         pill.pack(side="right", anchor="center")
-        tk.Label(pill, text="v 2.0", font=("Segoe UI", 8, "bold"),
+        tk.Label(pill, text="v 2.1", font=("Segoe UI", 8, "bold"),
                  bg=ACCENT_SOFT, fg=ACCENT).pack()
 
     # ── Body ─────────────────────────────────────────────────────────────────
