@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -19,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller
+        run: pip install -r requirements.txt pyinstaller pywin32
 
       - name: Build EXE with PyInstaller
         run: |
@@ -28,10 +30,30 @@ jobs:
             --collect-all pdf2docx `
             --collect-all pdfplumber `
             --collect-all reportlab `
+            --hidden-import win32com.client `
+            --hidden-import pythoncom `
             converter.py
 
-      - name: Upload EXE artifact
-        uses: actions/upload-artifact@v4
+      - name: Create / update GitHub Release with EXE
+        uses: softprops/action-gh-release@v2
         with:
-          name: Convertly-Windows
-          path: dist/Convertly.exe
+          tag_name: v2.1
+          name: "Convertly v2.1"
+          body: |
+            ## Convertly v2.1
+
+            **What's new**
+            - Word → PDF now preserves inline images, text alignment, text colours, font sizes, underline and list bullets
+            - Word → PDF tables now use the original cell background colours
+            - Excel → PDF now preserves cell background colours, bold fonts, cell alignment and merged cells
+            - PDF → Word now uses Microsoft Word (if installed) or LibreOffice for highest-fidelity conversion
+            - PDF → Word post-processing removes excessive blank space between sections
+
+            ---
+            **Developer:** Ibrahim Ezzeldin Mirghani
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: dist/Convertly.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -21,11 +21,135 @@ def _open_path(path):
 
 # ── Conversion Functions ─────────────────────────────────────────────────────
 
+def _cleanup_docx_spacing(docx_path):
+    """
+    Post-process a converted DOCX to remove excessive blank space:
+    - Collapses runs of more than 2 consecutive empty paragraphs into 1
+    - Caps paragraph spaceBefore/spaceAfter values above 72 pt
+    - Removes isolated page-break elements near the top of the document
+    """
+    from docx import Document
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+    try:
+        doc = Document(docx_path)
+
+        # ── 1. Remove excessive consecutive blank paragraphs ──
+        blank_run = 0
+        to_remove = []
+        for para in doc.paragraphs:
+            if not para.text.strip():
+                blank_run += 1
+                if blank_run > 2:
+                    to_remove.append(para)
+            else:
+                blank_run = 0
+        for para in to_remove:
+            p = para._element
+            parent = p.getparent()
+            if parent is not None:
+                parent.remove(p)
+
+        # ── 2. Cap runaway spaceBefore / spaceAfter ──
+        for para in doc.paragraphs:
+            pf = para.paragraph_format
+            try:
+                if pf.space_before and pf.space_before.pt > 72:
+                    pf.space_before = Pt(18)
+            except Exception:
+                pass
+            try:
+                if pf.space_after and pf.space_after.pt > 72:
+                    pf.space_after = Pt(8)
+            except Exception:
+                pass
+
+        # ── 3. Remove stray page-break runs near the top ──
+        for para in list(doc.paragraphs)[:10]:
+            if para.text.strip():
+                continue
+            for run in para.runs:
+                for br in run._element.findall(f'.//{qn("w:br")}'):
+                    if br.get(qn('w:type')) == 'page':
+                        br.getparent().remove(br)
+
+        doc.save(docx_path)
+    except Exception:
+        pass  # never let cleanup crash the whole conversion
+
+
 def pdf_to_word(pdf_path, out_path, stop_event=None):
-    from pdf2docx import Converter
-    cv = Converter(pdf_path)
-    cv.convert(out_path)
-    cv.close()
+    """
+    Converts PDF → DOCX using the best available engine:
+      1. Microsoft Word via COM (Windows, highest fidelity)
+      2. LibreOffice via subprocess (if installed)
+      3. pdf2docx (pure-Python fallback)
+    Then post-processes to collapse excessive blank space.
+    """
+    import shutil
+    abs_pdf = os.path.abspath(pdf_path)
+    abs_out = os.path.abspath(out_path)
+    converted = False
+
+    # ── 1. Microsoft Word (COM) ───────────────────────────────────────────────
+    if not converted:
+        try:
+            import pythoncom, win32com.client
+            pythoncom.CoInitialize()
+            word = None
+            try:
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = False
+                doc = word.Documents.Open(abs_pdf)
+                doc.SaveAs2(abs_out, FileFormat=16)
+                doc.Close(False)
+                converted = True
+            finally:
+                try:
+                    if word: word.Quit()
+                except Exception:
+                    pass
+                pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    # ── 2. LibreOffice ────────────────────────────────────────────────────────
+    if not converted:
+        lo_paths = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ]
+        for lo in lo_paths:
+            if os.path.exists(lo):
+                try:
+                    out_dir = os.path.dirname(abs_out)
+                    subprocess.run(
+                        [lo, "--headless", "--convert-to", "docx",
+                         "--outdir", out_dir, abs_pdf],
+                        timeout=120, check=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    lo_out = os.path.join(
+                        out_dir,
+                        os.path.splitext(os.path.basename(pdf_path))[0] + ".docx"
+                    )
+                    if os.path.exists(lo_out) and os.path.abspath(lo_out) != abs_out:
+                        shutil.move(lo_out, abs_out)
+                    converted = True
+                except Exception:
+                    pass
+                break
+
+    # ── 3. pdf2docx (fallback) ────────────────────────────────────────────────
+    if not converted:
+        from pdf2docx import Converter
+        cv = Converter(abs_pdf)
+        cv.convert(abs_out)
+        cv.close()
+
+    # ── Post-process: collapse excessive blank space ───────────────────────────
+    _cleanup_docx_spacing(abs_out)
 
 def pdf_to_excel(pdf_path, out_path, stop_event=None):
     import pdfplumber, openpyxl
@@ -50,125 +174,259 @@ def pdf_to_excel(pdf_path, out_path, stop_event=None):
 def word_to_pdf(docx_path, out_path, stop_event=None):
     """
     Converts DOCX to PDF using python-docx + reportlab.
-    No Microsoft Word required — pure Python.
+    Preserves: document element order, inline images, text alignment,
+    text colors, font sizes, bold/italic/underline, list bullets,
+    and table cell background colors from the original DOCX.
     """
+    import tempfile
     from docx import Document
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph as DocxParagraph
+    from docx.table import Table as DocxTable
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.lib import colors
-    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                    Table, TableStyle, HRFlowable)
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle,
+                                    Image as RLImage)
 
-    doc  = Document(docx_path)
-    pdf  = SimpleDocTemplate(
-        out_path,
-        pagesize=A4,
+    A_NS  = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    R_NS  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+
+    doc = Document(docx_path)
+    pdf = SimpleDocTemplate(
+        out_path, pagesize=A4,
         leftMargin=2.5*cm, rightMargin=2.5*cm,
         topMargin=2.5*cm,  bottomMargin=2.5*cm,
     )
 
     base_styles = getSampleStyleSheet()
-    story = []
+    story      = []
+    tmp_images = []
+    max_w      = A4[0] - 5 * cm
+    _sc        = [0]  # style name counter for uniqueness
 
-    style_normal = ParagraphStyle(
-        "Normal2", parent=base_styles["Normal"],
-        fontSize=11, leading=16, spaceAfter=4,
-    )
-    style_h1 = ParagraphStyle(
-        "H1", parent=base_styles["Heading1"],
-        fontSize=18, leading=22, spaceBefore=12, spaceAfter=6,
-        textColor=colors.HexColor("#0F1117"),
-    )
-    style_h2 = ParagraphStyle(
-        "H2", parent=base_styles["Heading2"],
-        fontSize=14, leading=18, spaceBefore=10, spaceAfter=4,
-        textColor=colors.HexColor("#1a1d2e"),
-    )
-    style_h3 = ParagraphStyle(
-        "H3", parent=base_styles["Heading3"],
-        fontSize=12, leading=16, spaceBefore=8, spaceAfter=3,
-        textColor=colors.HexColor("#2d3250"),
-    )
+    try:
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        ALIGN_MAP = {
+            WD_ALIGN_PARAGRAPH.LEFT:    TA_LEFT,
+            WD_ALIGN_PARAGRAPH.CENTER:  TA_CENTER,
+            WD_ALIGN_PARAGRAPH.RIGHT:   TA_RIGHT,
+            WD_ALIGN_PARAGRAPH.JUSTIFY: TA_JUSTIFY,
+        }
+    except Exception:
+        ALIGN_MAP = {}
 
-    heading_map = {
-        "Heading 1": style_h1,
-        "Heading 2": style_h2,
-        "Heading 3": style_h3,
-    }
+    def esc(t):
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    for para in doc.paragraphs:
+    def run_markup(run):
+        rt = esc(run.text)
+        if not rt:
+            return ""
+        # Font color
+        try:
+            if run.font.color and run.font.color.type is not None:
+                rgb = str(run.font.color.rgb)
+                rt = f'<font color="#{rgb}">{rt}</font>'
+        except Exception:
+            pass
+        # Font size
+        try:
+            if run.font.size:
+                rt = f'<font size="{run.font.size.pt:.1f}">{rt}</font>'
+        except Exception:
+            pass
+        # Bold / italic / underline
+        if getattr(run, 'bold', False) and getattr(run, 'italic', False):
+            rt = f"<b><i>{rt}</i></b>"
+        elif getattr(run, 'bold', False):
+            rt = f"<b>{rt}</b>"
+        elif getattr(run, 'italic', False):
+            rt = f"<i>{rt}</i>"
+        if getattr(run, 'underline', False):
+            rt = f"<u>{rt}</u>"
+        return rt
+
+    def make_style(style_name, alignment, base_size=11):
+        _sc[0] += 1
+        sn = f"_S{_sc[0]}"
+        al = ALIGN_MAP.get(alignment, TA_LEFT)
+        leading = max(base_size * 1.45, 14)
+        if "Heading 1" in style_name:
+            return ParagraphStyle(sn, parent=base_styles["Heading1"],
+                fontSize=18, leading=22, spaceBefore=12, spaceAfter=6, alignment=al)
+        elif "Heading 2" in style_name:
+            return ParagraphStyle(sn, parent=base_styles["Heading2"],
+                fontSize=14, leading=18, spaceBefore=10, spaceAfter=4, alignment=al)
+        elif "Heading 3" in style_name:
+            return ParagraphStyle(sn, parent=base_styles["Heading3"],
+                fontSize=12, leading=16, spaceBefore=8, spaceAfter=3, alignment=al)
+        else:
+            return ParagraphStyle(sn, parent=base_styles["Normal"],
+                fontSize=base_size, leading=leading, spaceAfter=4,
+                leftIndent=(18 if "List" in style_name else 0),
+                alignment=al)
+
+    def extract_images(para_elem):
+        imgs = []
+        blips = para_elem.findall(f'.//{{{A_NS}}}blip')
+        for blip in blips:
+            r_embed = blip.get(f'{{{R_NS}}}embed')
+            if not r_embed or r_embed not in doc.part.rels:
+                continue
+            try:
+                img_part = doc.part.rels[r_embed].target_part
+                img_data = img_part.blob
+                ext = img_part.content_type.split('/')[-1]
+                if ext == 'jpeg':
+                    ext = 'jpg'
+                tmp = tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False)
+                tmp.write(img_data)
+                tmp.close()
+                tmp_images.append(tmp.name)
+                # Get dimensions from EMU → pt
+                extents = para_elem.findall(f'.//{{{WP_NS}}}extent')
+                if extents:
+                    cx = int(extents[0].get('cx', 0))
+                    cy = int(extents[0].get('cy', 0))
+                    w = cx / 914400 * 72
+                    h = cy / 914400 * 72
+                    if w > max_w:
+                        h = h * max_w / w
+                        w = max_w
+                    img = RLImage(tmp.name, width=w, height=h)
+                else:
+                    img = RLImage(tmp.name, width=min(300, max_w))
+                imgs.append(img)
+            except Exception:
+                pass
+        return imgs
+
+    def get_cell_bg(cell):
+        tc_pr = cell._tc.find(qn('w:tcPr'))
+        if tc_pr is not None:
+            shd = tc_pr.find(qn('w:shd'))
+            if shd is not None:
+                fill = shd.get(qn('w:fill'))
+                if fill and fill not in ('auto',) and len(fill) == 6:
+                    try:
+                        return colors.HexColor(f"#{fill}")
+                    except Exception:
+                        pass
+        return None
+
+    # Iterate body elements in document order
+    for elem in doc.element.body:
         if stop_event and stop_event.is_set():
             raise InterruptedError("Cancelled by user.")
 
-        text = para.text.strip()
-        if not text:
-            story.append(Spacer(1, 6))
-            continue
+        tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
 
-        # Escape XML special chars
-        text = (text.replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;"))
+        if tag == 'p':
+            para = DocxParagraph(elem, doc)
 
-        style_name = para.style.name if para.style else "Normal"
-        p_style = heading_map.get(style_name, style_normal)
+            # Embed any inline images first
+            for img in extract_images(elem):
+                story.append(img)
+                story.append(Spacer(1, 4))
 
-        # Bold / italic from runs
-        parts = []
-        for run in para.runs:
-            rt = (run.text
-                  .replace("&", "&amp;")
-                  .replace("<", "&lt;")
-                  .replace(">", "&gt;"))
-            if run.bold and run.italic:
-                parts.append(f"<b><i>{rt}</i></b>")
-            elif run.bold:
-                parts.append(f"<b>{rt}</b>")
-            elif run.italic:
-                parts.append(f"<i>{rt}</i>")
-            else:
-                parts.append(rt)
+            text = para.text.strip()
+            if not text:
+                story.append(Spacer(1, 6))
+                continue
 
-        rich_text = "".join(parts) if parts else text
-        story.append(Paragraph(rich_text, p_style))
+            style_name = para.style.name if para.style else "Normal"
 
-    # Tables
-    for table in doc.tables:
-        if stop_event and stop_event.is_set():
-            raise InterruptedError("Cancelled by user.")
-        data = []
-        for row in table.rows:
-            data.append([cell.text for cell in row.cells])
-        if data:
+            # Detect base font size from first sized run
+            base_size = 11
+            for run in para.runs:
+                try:
+                    if run.font.size:
+                        base_size = run.font.size.pt
+                        break
+                except Exception:
+                    pass
+
+            p_style = make_style(style_name, para.alignment, base_size)
+
+            parts = [run_markup(run) for run in para.runs]
+            rich_text = "".join(parts) or esc(text)
+
+            if "List Bullet" in style_name:
+                rich_text = "• " + rich_text
+
+            story.append(Paragraph(rich_text, p_style))
+
+        elif tag == 'tbl':
+            tbl = DocxTable(elem, doc)
+            data   = []
+            bg_map = {}  # (row_idx, col_idx) → HexColor
+
+            for r_idx, row in enumerate(tbl.rows):
+                row_data = []
+                for c_idx, cell in enumerate(row.cells):
+                    row_data.append(cell.text)
+                    bg = get_cell_bg(cell)
+                    if bg:
+                        bg_map[(r_idx, c_idx)] = bg
+                data.append(row_data)
+
+            if not data:
+                continue
+
             num_cols = max(len(r) for r in data)
-            col_w = (A4[0] - 5*cm) / max(num_cols, 1)
-            tbl = Table(data, colWidths=[col_w]*num_cols)
-            tbl.setStyle(TableStyle([
-                ("BACKGROUND",  (0,0), (-1,0), colors.HexColor("#4361EE")),
-                ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
-                ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
-                ("FONTSIZE",    (0,0), (-1,-1), 9),
-                ("GRID",        (0,0), (-1,-1), 0.4, colors.HexColor("#DDDFE8")),
-                ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, colors.HexColor("#F5F7FF")]),
-                ("TOPPADDING",  (0,0), (-1,-1), 4),
-                ("BOTTOMPADDING",(0,0),(-1,-1), 4),
-                ("LEFTPADDING", (0,0), (-1,-1), 6),
-            ]))
+            col_w    = max_w / max(num_cols, 1)
+            data     = [r + [""] * (num_cols - len(r)) for r in data]
+
+            ts = [
+                ("FONTSIZE",       (0, 0), (-1, -1), 9),
+                ("GRID",           (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+                ("TOPPADDING",     (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
+                ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+                ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
+            ]
+            for (r, c), bg in bg_map.items():
+                ts.append(("BACKGROUND", (c, r), (c, r), bg))
+
+            # Default header row only when the first cell has no custom color
+            if (0, 0) not in bg_map:
+                ts += [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4361EE")),
+                    ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                     [colors.white, colors.HexColor("#F5F7FF")]),
+                ]
+
+            rl_tbl = Table(data, colWidths=[col_w] * num_cols)
+            rl_tbl.setStyle(TableStyle(ts))
             story.append(Spacer(1, 6))
-            story.append(tbl)
+            story.append(rl_tbl)
             story.append(Spacer(1, 6))
 
     if not story:
-        story.append(Paragraph("(Empty document)", style_normal))
+        story.append(Paragraph("(Empty document)",
+            ParagraphStyle("_empty", parent=base_styles["Normal"], fontSize=11)))
 
-    pdf.build(story)
+    try:
+        pdf.build(story)
+    finally:
+        for tmp in tmp_images:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
 def excel_to_pdf(xlsx_path, out_path, stop_event=None):
     """
     Uses openpyxl + reportlab to convert Excel → PDF.
-    No LibreOffice required — pure Python.
+    Preserves: cell background colors, font bold, cell alignment,
+    and merged cell spans from the original spreadsheet.
     """
     import openpyxl
     from reportlab.lib.pagesizes import A4, landscape
@@ -177,8 +435,7 @@ def excel_to_pdf(xlsx_path, out_path, stop_event=None):
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import cm
 
-    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-
+    wb    = openpyxl.load_workbook(xlsx_path, data_only=True)
     story = []
     styles = getSampleStyleSheet()
 
@@ -188,43 +445,107 @@ def excel_to_pdf(xlsx_path, out_path, stop_event=None):
 
         ws = wb[sheet_name]
 
-        # Sheet title
         story.append(Paragraph(f"<b>{sheet_name}</b>", styles["Heading2"]))
         story.append(Spacer(1, 0.3 * cm))
 
-        # Collect data
-        data = []
-        col_widths = []
-        for row in ws.iter_rows(values_only=True):
-            row_data = [str(cell) if cell is not None else "" for cell in row]
-            data.append(row_data)
-
-        if not data:
+        rows = list(ws.iter_rows())
+        if not rows:
             continue
 
-        # Auto column widths
-        num_cols = max(len(r) for r in data)
-        page_w = landscape(A4)[0] - 2 * cm
-        col_w  = page_w / max(num_cols, 1)
-        col_widths = [col_w] * num_cols
+        num_cols = ws.max_column or 1
+        num_rows = ws.max_row    or 1
 
-        # Pad rows
+        # Base table commands
+        ts = [
+            ("FONTSIZE",       (0, 0), (-1, -1), 8),
+            ("ALIGN",          (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING",     (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 3),
+            ("LEFTPADDING",    (0, 0), (-1, -1), 4),
+            ("GRID",           (0, 0), (-1, -1), 0.3, colors.HexColor("#CCCCCC")),
+        ]
+
+        data        = []
+        has_any_bg  = False
+
+        for r_idx, row in enumerate(rows):
+            row_data = []
+            for c_idx, cell in enumerate(row):
+                val = str(cell.value) if cell.value is not None else ""
+                row_data.append(val)
+
+                # Cell background color
+                try:
+                    fill = cell.fill
+                    if fill and fill.fill_type not in (None, 'none'):
+                        fg = fill.fgColor
+                        if fg and fg.type == 'rgb' and fg.rgb:
+                            rgb = fg.rgb[-6:]  # strip alpha channel
+                            if rgb.upper() not in ('FFFFFF', '000000', '000000'):
+                                ts.append(("BACKGROUND",
+                                           (c_idx, r_idx), (c_idx, r_idx),
+                                           colors.HexColor(f"#{rgb}")))
+                                has_any_bg = True
+                except Exception:
+                    pass
+
+                # Font bold
+                try:
+                    if cell.font and cell.font.bold:
+                        ts.append(("FONTNAME",
+                                   (c_idx, r_idx), (c_idx, r_idx),
+                                   "Helvetica-Bold"))
+                except Exception:
+                    pass
+
+                # Cell text alignment
+                try:
+                    if cell.alignment and cell.alignment.horizontal:
+                        al_map = {
+                            'center':  'CENTER',
+                            'right':   'RIGHT',
+                            'left':    'LEFT',
+                            'general': 'LEFT',
+                        }
+                        al = al_map.get(cell.alignment.horizontal)
+                        if al:
+                            ts.append(("ALIGN",
+                                       (c_idx, r_idx), (c_idx, r_idx), al))
+                except Exception:
+                    pass
+
+            data.append(row_data)
+
+        if not any(any(c for c in r) for r in data):
+            continue
+
+        # Merged cell spans
+        for merge in ws.merged_cells.ranges:
+            r1 = merge.min_row - 1
+            c1 = merge.min_col - 1
+            r2 = merge.max_row - 1
+            c2 = merge.max_col - 1
+            ts.append(("SPAN", (c1, r1), (c2, r2)))
+
+        # Fall back to default header styling only when no cell has a custom color
+        if not has_any_bg:
+            ts += [
+                ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#4361EE")),
+                ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",       (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                 [colors.white, colors.HexColor("#F5F7FF")]),
+            ]
+
+        # Pad rows and build table
         data = [r + [""] * (num_cols - len(r)) for r in data]
 
-        tbl = Table(data, colWidths=col_widths, repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#4361EE")),
-            ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.white),
-            ("FONTNAME",    (0, 0), (-1, 0),  "Helvetica-Bold"),
-            ("FONTSIZE",    (0, 0), (-1, -1), 8),
-            ("ALIGN",       (0, 0), (-1, -1), "LEFT"),
-            ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F7FF")]),
-            ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#DDDFE8")),
-            ("TOPPADDING",  (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ]))
+        page_w  = landscape(A4)[0] - 2 * cm
+        col_w   = page_w / max(num_cols, 1)
+
+        tbl = Table(data, colWidths=[col_w] * num_cols, repeatRows=1)
+        tbl.setStyle(TableStyle(ts))
         story.append(tbl)
         story.append(Spacer(1, 0.5 * cm))
 
@@ -232,7 +553,7 @@ def excel_to_pdf(xlsx_path, out_path, stop_event=None):
         out_path,
         pagesize=landscape(A4),
         leftMargin=1*cm, rightMargin=1*cm,
-        topMargin=1*cm,  bottomMargin=1*cm
+        topMargin=1*cm,  bottomMargin=1*cm,
     )
     doc.build(story)
 
